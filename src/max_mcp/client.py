@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
-from pymax import Client, WebClient
+from pymax import Client, ExtraConfig, WebClient
 
 from . import secure
+from .net import configure_proxy
 
 SESSION_DIR = pathlib.Path.home() / ".max-mcp"
 SESSION_FILE = "session.db"
@@ -32,6 +33,7 @@ def _read_kind() -> tuple[str, str | None]:
 
 def _build_client():
     kind, phone = _read_kind()
+    extra = ExtraConfig(proxy=configure_proxy())
     if kind == "sms":
         if not phone:
             raise RuntimeError(
@@ -41,8 +43,13 @@ def _build_client():
             phone=phone,
             work_dir=str(SESSION_DIR),
             session_name=SESSION_FILE,
+            extra_config=extra,
         )
-    return WebClient(work_dir=str(SESSION_DIR), session_name=SESSION_FILE)
+    return WebClient(
+        work_dir=str(SESSION_DIR),
+        session_name=SESSION_FILE,
+        extra_config=extra,
+    )
 
 
 @asynccontextmanager

@@ -6,12 +6,14 @@ import sys
 from pymax import (
     Client,
     ConsolePasswordProvider,
-    ConsoleQrHandler,
     ConsoleSmsCodeProvider,
+    ExtraConfig,
     WebClient,
 )
 
 from . import secure
+from .net import configure_proxy
+from .qr import FileQrHandler
 
 SESSION_DIR = pathlib.Path.home() / ".max-mcp"
 SESSION_FILE = "session.db"
@@ -57,7 +59,8 @@ async def _login_qr() -> None:
     client = WebClient(
         work_dir=str(SESSION_DIR),
         session_name=SESSION_FILE,
-        qr_provider=ConsoleQrHandler(),
+        qr_provider=FileQrHandler(),
+        extra_config=ExtraConfig(proxy=configure_proxy()),
     )
     logged_in = asyncio.Event()
 
@@ -80,6 +83,7 @@ async def _login_sms(phone: str) -> None:
         session_name=SESSION_FILE,
         sms_code_provider=ConsoleSmsCodeProvider(),
         password_provider=ConsolePasswordProvider(),
+        extra_config=ExtraConfig(proxy=configure_proxy()),
     )
     logged_in = asyncio.Event()
 
