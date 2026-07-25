@@ -2,6 +2,8 @@
 
 > MCP server that gives Claude Code full access to your **MAX** messenger account — read chats, dump channels, send messages and files.
 
+> **This is a fork of [renosaza/max-mcp](https://github.com/renosaza/max-mcp)** that makes the server run on Windows, fixes the login crash from upstream [issue #1](https://github.com/renosaza/max-mcp/issues/1), and repairs `dump_channel` pagination. See [Changes in this fork](#changes-in-this-fork).
+
 MAX (max.ru) is a Russian messenger by VK with ~50 M users. This server uses a **user session** (not a bot token), so it can access your DM list, arbitrary channels, and post on your behalf — things the official Bot API cannot do.
 
 ---
@@ -36,12 +38,14 @@ For SMM analytics and content workflows you need a **user-level session** — th
     server.py        # FastMCP stdio entrypoint
     client.py        # WebClient/Client singleton + lifespan
     auth.py          # CLI for login-qr / login-sms
+    secure.py        # session-dir hardening (POSIX modes / Windows ACLs)
     normalize.py     # pymax models → plain JSON dicts
     tools/
       chats.py       # list_chats, get_chat
       messages.py    # read_messages, search_messages
       channels.py    # list_channel_posts, dump_channel
       send.py        # send_message, send_file
+  tests/             # pytest — pagination, secure storage, path validation
 
 ~/.max-mcp/                            ← session (permanent, secret)
   session.db        # pymax SQLite session — chmod 600
@@ -55,9 +59,9 @@ Code and session live in separate locations on purpose: the code can be deleted 
 
 ## Requirements
 
-- macOS / Linux
+- macOS / Linux / **Windows**
 - Python 3.11 – 3.13
-- [uv](https://github.com/astral-sh/uv) (`brew install uv` or `curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- [uv](https://github.com/astral-sh/uv) — optional, plain `venv` + `pip` works too
 - Claude Code CLI (`npm install -g @anthropic-ai/claude-code`)
 
 ---
@@ -66,11 +70,24 @@ Code and session live in separate locations on purpose: the code can be deleted 
 
 ### 1. Install dependencies
 
+**macOS / Linux:**
+
 ```bash
-git clone https://github.com/renosaza/max-mcp.git ~/Documents/claude-projects/max-mcp
+git clone https://github.com/skiddgoddamn/max-mcp.git ~/Documents/claude-projects/max-mcp
 cd ~/Documents/claude-projects/max-mcp
 uv sync
 ```
+
+**Windows (PowerShell):**
+
+```powershell
+git clone https://github.com/skiddgoddamn/max-mcp.git $HOME\max-mcp
+cd $HOME\max-mcp
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+
+The session directory is `%USERPROFILE%\.max-mcp` and is restricted to your account with `icacls` (see [Security](#security)).
 
 ### 2. Authenticate
 
@@ -96,11 +113,24 @@ uv run python -m max_mcp.auth login-sms --phone +79991234567
 
 PyMax prompts interactively for the SMS code (arrives in MAX or as SMS) and, if 2FA is enabled, your password.
 
+On Windows, run the same commands through the venv interpreter:
+
+```powershell
+.\.venv\Scripts\python.exe -m max_mcp.auth login-qr
+.\.venv\Scripts\python.exe -m max_mcp.auth login-sms --phone +79991234567
+```
+
 ### 3. Register in Claude Code
 
 ```bash
 claude mcp add max-mcp --scope user \
   -- uv run --directory ~/Documents/claude-projects/max-mcp python -m max_mcp.server
+```
+
+Windows (no uv needed — point Claude Code straight at the venv interpreter):
+
+```powershell
+claude mcp add max-mcp --scope user -- "$HOME\max-mcp\.venv\Scripts\python.exe" -m max_mcp.server
 ```
 
 Verify it's connected:
@@ -243,7 +273,7 @@ Channel posts with reactions and stats. Same pagination as `read_messages`.
 
 ---
 
-#### `dump_channel(channel_id, since_time=None, max_posts=1000)`
+#### `dump_channel(channel_id, since_time=None, max_posts=1000, before_time=None)`
 
 Bulk dump for analytics. Hard cap of 1000 posts per call.
 
@@ -251,14 +281,20 @@ Bulk dump for analytics. Hard cap of 1000 posts per call.
 {
   "posts": [...],
   "count": 1000,
-  "stopped_reason": "max_posts"
+  "stopped_reason": "max_posts",
+  "next_before_time": 1717519000000
 }
 ```
 
 `stopped_reason` values:
-- `max_posts` — hit the `max_posts` cap (call again with smaller `before_time`)
+- `max_posts` — hit the `max_posts` cap; continue from `next_before_time`
 - `since_time` — reached the requested time boundary
 - `exhausted` — reached the beginning of channel history
+
+`next_before_time` is non-null only when there is more to fetch.
+
+> Upstream accepted no `before_time` and returned no cursor, so every call
+> restarted at the newest post and no channel could be read past `max_posts`.
 
 **Full archive pattern:**
 
@@ -269,9 +305,9 @@ all_posts = []
 while True:
     result = dump_channel(channel_id=X, max_posts=1000, before_time=before_time)
     all_posts.extend(result["posts"])
-    if result["stopped_reason"] != "max_posts":
+    before_time = result["next_before_time"]
+    if before_time is None:
         break
-    before_time = min(p["time"] for p in result["posts"]) - 1
 ```
 
 ---
@@ -307,10 +343,14 @@ Send a file. Attachment type is chosen by extension:
 
 `file_path` must be an **absolute path** to a regular file (no symlinks).
 
-**Security:** By default only paths inside `~/Downloads`, `~/Documents`, and `/tmp` are allowed. Paths under `~/.ssh`, `~/.aws`, `~/.max-mcp`, `/etc`, `/var`, and macOS Keychains are always denied. Override the allowlist:
+**Security:** By default only paths inside `~/Downloads`, `~/Documents`, and the system temp directory are allowed. Paths under `~/.ssh`, `~/.aws`, `~/.max-mcp`, `/etc`, `/var`, macOS Keychains and `C:\Windows` are always denied. Override the allowlist — the separator is the platform's own (`:` on POSIX, `;` on Windows):
 
 ```bash
 export MAX_MCP_SEND_ROOTS=~/Desktop:/data/exports
+```
+
+```powershell
+$env:MAX_MCP_SEND_ROOTS = "$HOME\Desktop;D:\exports"
 ```
 
 ---
@@ -373,7 +413,7 @@ export MAX_MCP_OUTPUT_TOKENS=80000
 | `stats` / `reaction_info` schema is undocumented | Inspect the raw output on real channel posts. |
 | `reply_to_id` requires `type == "REPLY"` (string, uppercased) | If pymax changes the enum serialization, replies will always return `null`. |
 | Sessions don't auto-refresh indefinitely | Re-run `login-qr` / `login-sms` when the session expires. |
-| `dump_channel` hard cap = 1000 posts/call | Call repeatedly with decreasing `before_time`. |
+| `dump_channel` hard cap = 1000 posts/call | Call repeatedly, feeding back `next_before_time`. |
 | `sender` is a numeric ID, not a name | MAX has no public user-lookup endpoint in the user-session API. |
 | `chat_id` is `null` in DM messages | This is a pymax 2.1.2 behaviour for direct messages. |
 
@@ -381,9 +421,10 @@ export MAX_MCP_OUTPUT_TOKENS=80000
 
 ## Security
 
-- `~/.max-mcp/` is created `chmod 700`; files are `chmod 600`.
-- Session files are written with `O_CREAT|O_EXCL|O_NOFOLLOW` (no TOCTOU, no symlink follow).
-- `send_file` validates paths against a denylist (`~/.ssh`, `~/.aws`, etc.) and an allowlist (`~/Downloads`, `~/Documents`, `/tmp` by default). Symlinks are rejected at the leaf.
+- **POSIX:** `~/.max-mcp/` is created `chmod 700`, files are `chmod 600`, and the server refuses to start if either the owner or the mode is wrong.
+- **Windows:** the same directory is hardened with `icacls /inheritance:r /grant:r`, so only your account keeps an ACE. On start the DACL is read back through `icacls /save` (SDDL, so raw SIDs — locale-independent) and the server refuses to run if a broad principal such as Everyone, Users or Authenticated Users still has access.
+- Session files are written with `O_CREAT|O_TRUNC|O_NOFOLLOW` (plus `O_BINARY|O_NOINHERIT` on Windows), and a symlink planted at the target path is removed rather than followed.
+- `send_file` validates paths against a denylist (`~/.ssh`, `~/.aws`, etc.) and an allowlist (`~/Downloads`, `~/Documents`, the temp dir by default). Symlinks and Windows reparse points are rejected at the leaf.
 - The server runs locally over stdio — no network port is opened.
 
 ---
@@ -396,6 +437,39 @@ export MAX_MCP_OUTPUT_TOKENS=80000
 - Python 3.11 – 3.13
 
 `uv.lock` pins the full transitive closure (e.g. `mcp==1.27.2`, `qrcode==8.2`).
+
+---
+
+## Development
+
+```bash
+uv sync --group dev && uv run pytest          # macOS / Linux
+```
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install pytest
+.\.venv\Scripts\python.exe -m pytest          # Windows
+```
+
+Two tests are POSIX-only and two are Windows-only; they skip on the other platform.
+
+---
+
+## Changes in this fork
+
+Everything below is fixed relative to [renosaza/max-mcp](https://github.com/renosaza/max-mcp) @ `050a947`.
+
+| # | Problem upstream | Fix |
+|---|---|---|
+| 1 | **Would not run on Windows at all.** `auth.py` and `client.py` called `os.getuid()` (POSIX-only) and `os.O_NOFOLLOW` (undefined on Windows), and the `st_mode & 0o077` check rejects every Windows directory, since Windows does not carry mode bits. | New `max_mcp/secure.py` expresses the same intent per platform: mode bits + owner check on POSIX, `icacls` ACL hardening and an SDDL read-back on Windows. |
+| 2 | **QR/SMS login crashed after succeeding** ([issue #1](https://github.com/renosaza/max-mcp/issues/1)). `on_start` calls `client.stop()`, which cancels the reader that `client.start()` is still awaiting; the `CancelledError` escaped before `session.kind` was written, so the next start picked the wrong client type. | `_start_until_logged_in()` swallows that cancellation only once the login is confirmed, and re-raises it when the task was cancelled from the outside (`task.cancelling()`). |
+| 3 | **`dump_channel` could not page.** The docstring and README told callers to pass a shrinking `before_time`, but the tool had no such parameter and always started at the newest post — nothing beyond the first `max_posts` was reachable. | `before_time` is now a real parameter and the result carries `next_before_time`; pagination logic moved into `collect_posts()` and is covered by tests. |
+| 4 | `messages[-1]["time"] - 1` raised `TypeError` when a service event arrived without a `time`. | Single `next_cursor()` helper returns `None` instead of subtracting from `None`. |
+| 5 | `MAX_MCP_SEND_ROOTS` was split on `":"`, which tears `C:\Users\me` into `C` and `\Users\me` — every Windows allowlist silently became empty, so `send_file` refused everything. | Split on `os.pathsep`; root matching is `normcase`d so drive-letter case does not matter; `/tmp` default replaced by `tempfile.gettempdir()`. |
+| 6 | Error messages hardcoded the author's own path (`~/Documents/claude-projects/max-mcp`). | Replaced with the module-invocation commands that work from any checkout. |
+| 7 | No tests at all. | 18 tests covering pagination, cursors, the secure-storage round-trip, ACL narrowing on Windows and `send_file` path validation. |
+
+Not changed: the tool surface (still the same 8 tools), the protocol layer, or the security model's intent.
 
 ---
 
