@@ -13,7 +13,7 @@ from pymax import (
 
 from . import secure
 from .net import configure_proxy
-from .qr import FileQrHandler
+from .qr_server import LocalQrServer, RefreshingQrAuthFlow
 
 SESSION_DIR = pathlib.Path.home() / ".max-mcp"
 SESSION_FILE = "session.db"
@@ -56,10 +56,11 @@ async def _start_until_logged_in(client, logged_in: asyncio.Event) -> None:
 
 async def _login_qr() -> None:
     secure.ensure_dir(SESSION_DIR)
+    server = LocalQrServer()
     client = WebClient(
         work_dir=str(SESSION_DIR),
         session_name=SESSION_FILE,
-        qr_provider=FileQrHandler(),
+        auth_flow=RefreshingQrAuthFlow(server),
         extra_config=ExtraConfig(proxy=configure_proxy()),
     )
     logged_in = asyncio.Event()
@@ -67,12 +68,17 @@ async def _login_qr() -> None:
     @client.on_start()
     async def _ready(c: WebClient) -> None:
         _print_me(c)
+        server.connected()
         logged_in.set()
         await c.stop()
 
-    await _start_until_logged_in(client, logged_in)
-    secure.harden_file(SESSION_DIR / SESSION_FILE)
-    _mark_session("web")
+    try:
+        await _start_until_logged_in(client, logged_in)
+        secure.harden_file(SESSION_DIR / SESSION_FILE)
+        _mark_session("web")
+        await asyncio.sleep(2)  # let the browser show the "connected" state
+    finally:
+        server.stop()
 
 
 async def _login_sms(phone: str) -> None:
