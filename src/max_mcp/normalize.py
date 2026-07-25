@@ -24,6 +24,32 @@ def chat_to_dict(chat: Any) -> dict[str, Any]:
     }
 
 
+def _display_name(names: Any) -> str | None:
+    for n in names or []:
+        get = n.get if isinstance(n, dict) else lambda k: getattr(n, k, None)
+        nm = get("name")
+        if not nm:
+            nm = " ".join(p for p in (get("first_name"), get("last_name")) if p) or None
+        if nm:
+            return nm
+    return None
+
+
+def user_to_dict(user: Any) -> dict[str, Any] | None:
+    if user is None:
+        return None
+    d = _dump(user) or {}
+    return {
+        "id": d.get("id") or getattr(user, "id", None),
+        "name": _display_name(d.get("names")),
+        "phone": d.get("phone"),
+        "description": d.get("description"),
+        "link": d.get("link"),
+        "photo_id": d.get("photo_id"),
+        "names": d.get("names") or [],
+    }
+
+
 def attach_to_dict(att: Any) -> dict[str, Any]:
     d = _dump(att) or {}
     kind = type(att).__name__
