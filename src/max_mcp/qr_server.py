@@ -1,9 +1,13 @@
-"""Localhost QR page for MAX device-link login.
+"""Localhost login page for MAX device-link auth.
 
-MAX QR links expire (~2 min) and pymax does not regenerate them. This serves the
-current link on http://127.0.0.1:<port> as an auto-refreshing page and pairs
-with RefreshingQrAuthFlow, which requests a fresh link whenever the old one
-expires — so the browser always shows a scannable code until you pair.
+MAX QR links expire (~2 min) and pymax neither regenerates them nor has a way to
+collect a 2FA cloud password without a TTY. This serves the whole flow on
+http://127.0.0.1:<port>:
+
+* an auto-refreshing QR (RefreshingQrAuthFlow requests a fresh link on expiry),
+* and, if the account has a 2FA password, an input field on the same page.
+
+The password is POSTed to localhost only — it never leaves the machine.
 """
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ import os
 import sys
 import threading
 import time
-import webbrowser
+import urllib.parse
 from typing import TYPE_CHECKING
 
 from pymax.auth.models import AuthResult
@@ -27,10 +31,11 @@ logger = get_logger(__name__)
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("MAX_MCP_QR_PORT", "5199"))
-# Give up regenerating after this long so a headless run can't spin forever.
 LOGIN_DEADLINE_S = int(os.environ.get("MAX_MCP_QR_TIMEOUT", "600"))
 
-_state = {"qr": None, "status": "waiting"}  # status: waiting | pending | open
+# status: waiting | pending | password | verifying | open
+_state = {"qr": None, "status": "waiting", "hint": None}
+_password = {"value": None}
 _lock = threading.Lock()
 
 _PAGE = """<!doctype html>
@@ -44,27 +49,43 @@ _PAGE = """<!doctype html>
  .card{background:#17171f;padding:32px 36px;border-radius:18px;text-align:center;
    box-shadow:0 12px 48px #000a;max-width:420px}
  h1{font-size:17px;font-weight:600;margin:0 0 20px;line-height:1.4}
- .frame{width:320px;height:320px;margin:0 auto;background:#fff;border-radius:14px;
+ .frame{width:320px;min-height:320px;margin:0 auto;background:#fff;border-radius:14px;
    display:flex;align-items:center;justify-content:center;overflow:hidden}
  .frame img{width:300px;height:300px}
  .ok{font-size:72px;line-height:320px}
  .st{color:#9a9aae;font-size:14px;margin:18px 0 0}
  .hint{color:#7a7a8e;font-size:12px;margin:8px 0 0}
+ form{display:flex;flex-direction:column;gap:12px;padding:22px;width:82%}
+ form .lbl{color:#333;font-size:14px}
+ form input{padding:11px;font-size:16px;border:1px solid #bbb;border-radius:8px}
+ form button{padding:11px;font-size:15px;border:0;border-radius:8px;background:#3b7;color:#fff;cursor:pointer}
 </style></head>
 <body><div class="card">
- <h1>MAX &rarr; Настройки &rarr; Устройства &rarr; Привязать устройство &rarr; сканировать</h1>
+ <h1 id="h">MAX &rarr; Настройки &rarr; Устройства &rarr; Привязать устройство &rarr; сканировать</h1>
  <div class="frame" id="frame"><span class="st">Ожидание QR…</span></div>
  <p class="st" id="st">Ожидание QR…</p>
- <p class="hint">QR обновляется автоматически, даже когда истекает. Вкладку можно закрыть после подключения.</p>
+ <p class="hint">QR обновляется автоматически. Пароль (если запросит) уходит только на localhost.</p>
 </div>
 <script>
+let mode=null;
+function esc(s){return (s||'').replace(/[<>&"]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));}
 async function tick(){
  try{
-  const s = await (await fetch('/state',{cache:'no-store'})).json();
+  const s=await (await fetch('/state',{cache:'no-store'})).json();
   const frame=document.getElementById('frame'), st=document.getElementById('st');
-  if(s.status==='open'){frame.innerHTML='<div class="ok">✅</div>';st.textContent='Подключено — можно закрыть вкладку.';return;}
-  if(s.hasQr){frame.innerHTML='<img alt="QR" src="/qr.svg?t='+Date.now()+'">';st.textContent='QR активен, обновляется автоматически.';}
-  else{st.textContent='Ожидание QR…';}
+  if(s.status==='open'){ if(mode!=='open'){mode='open';frame.innerHTML='<div class="ok">✅</div>';} st.textContent='Подключено — можно закрыть вкладку.'; return; }
+  if(s.status==='password'){
+   if(mode!=='password'){ mode='password';
+    frame.innerHTML='<form id="pf"><div class="lbl">Облачный пароль (2FA)'+(s.hint?': '+esc(s.hint):'')+'</div><input id="pw" type="password" autocomplete="off" autofocus><button>Отправить</button></form>';
+    document.getElementById('pf').onsubmit=async e=>{e.preventDefault();const v=document.getElementById('pw').value;
+     await fetch('/password',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'password='+encodeURIComponent(v)});
+     mode='verifying';document.getElementById('frame').innerHTML='<span class="st">Проверка пароля…</span>';};
+   }
+   st.textContent='Требуется пароль двухфакторной защиты.';
+  }
+  else if(s.status==='verifying'){ if(mode!=='verifying'){mode='verifying';frame.innerHTML='<span class="st">Проверка…</span>';} st.textContent='Проверка…'; }
+  else if(s.hasQr){ mode='qr'; frame.innerHTML='<img alt="QR" src="/qr.svg?t='+Date.now()+'">'; st.textContent='QR активен, обновляется автоматически.'; }
+  else{ st.textContent='Ожидание QR…'; }
  }catch(e){}
  setTimeout(tick,2000);
 }
@@ -93,7 +114,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         elif route == "/state":
             with _lock:
                 has = "true" if _state["qr"] else "false"
-                body = f'{{"status":"{_state["status"]}","hasQr":{has}}}'.encode()
+                hint = _state["hint"]
+                status = _state["status"]
+            hint_json = "null" if hint is None else '"' + hint.replace('"', "'") + '"'
+            body = f'{{"status":"{status}","hasQr":{has},"hint":{hint_json}}}'.encode()
             self._send(200, "application/json", body)
         elif route == "/qr.svg":
             with _lock:
@@ -108,6 +132,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"")
 
+    def do_POST(self):
+        if self.path.split("?", 1)[0] != "/password":
+            self._send(404, "text/plain", b"")
+            return
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+        pw = urllib.parse.parse_qs(raw).get("password", [""])[0]
+        with _lock:
+            _password["value"] = pw
+            _state["status"] = "verifying"
+        self._send(200, "application/json", b'{"ok":true}')
+
     def _send(self, code: int, ctype: str, body: bytes) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -119,7 +155,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 
 class LocalQrServer:
-    """QrHandler that serves the current login link on a localhost page."""
+    """Serves the login QR (and 2FA password prompt) on a localhost page."""
 
     def __init__(self) -> None:
         self._httpd: http.server.ThreadingHTTPServer | None = None
@@ -131,35 +167,71 @@ class LocalQrServer:
         try:
             http.server.ThreadingHTTPServer.allow_reuse_address = True
             self._httpd = http.server.ThreadingHTTPServer((HOST, PORT), _Handler)
-        except OSError as e:  # port busy — page from an earlier run still serves
+        except OSError as e:
             logger.warning("QR server not started (%s)", e)
             self._httpd = None
             return
         threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
-        logger.info("QR page live at http://%s:%s", HOST, PORT)
+        logger.info("Login page live at http://%s:%s", HOST, PORT)
 
     async def show_qr(self, qr_link: str) -> None:
         with _lock:
             _state["qr"] = qr_link
             _state["status"] = "pending"
+            _state["hint"] = None
         self._ensure()
         print(f"MAX login link: {qr_link}", file=sys.stderr, flush=True)
         if not self._opened:
             self._opened = True
             try:
+                import webbrowser
+
                 webbrowser.open(f"http://{HOST}:{PORT}")
             except Exception:
                 pass
+
+    def request_password(self, hint: str | None) -> None:
+        with _lock:
+            _state["status"] = "password"
+            _state["hint"] = hint
+            _state["qr"] = None
+            _password["value"] = None
+
+    def take_password(self) -> str | None:
+        with _lock:
+            v = _password["value"]
+            _password["value"] = None
+            return v
 
     def connected(self) -> None:
         with _lock:
             _state["status"] = "open"
             _state["qr"] = None
+            _password["value"] = None
 
     def stop(self) -> None:
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd = None
+
+
+class LocalPasswordProvider:
+    """PasswordProvider that collects the 2FA password from the localhost page."""
+
+    def __init__(self, server: LocalQrServer) -> None:
+        self._server = server
+
+    async def get_password(self, hint: str | None = None) -> str:
+        import asyncio
+
+        self._server.request_password(hint)
+        deadline = time.time() + LOGIN_DEADLINE_S
+        while time.time() < deadline:
+            pw = self._server.take_password()
+            if pw:
+                return pw
+            await asyncio.sleep(0.5)
+        raise RuntimeError("2FA password not entered in time")
 
 
 class RefreshingQrAuthFlow(QrAuthFlow):

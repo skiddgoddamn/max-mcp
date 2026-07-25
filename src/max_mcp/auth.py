@@ -13,7 +13,7 @@ from pymax import (
 
 from . import secure
 from .net import configure_proxy
-from .qr_server import LocalQrServer, RefreshingQrAuthFlow
+from .qr_server import LocalPasswordProvider, LocalQrServer, RefreshingQrAuthFlow
 
 SESSION_DIR = pathlib.Path.home() / ".max-mcp"
 SESSION_FILE = "session.db"
@@ -60,7 +60,7 @@ async def _login_qr() -> None:
     client = WebClient(
         work_dir=str(SESSION_DIR),
         session_name=SESSION_FILE,
-        auth_flow=RefreshingQrAuthFlow(server),
+        auth_flow=RefreshingQrAuthFlow(server, LocalPasswordProvider(server)),
         extra_config=ExtraConfig(proxy=configure_proxy()),
     )
     logged_in = asyncio.Event()
