@@ -1,7 +1,5 @@
 import asyncio
-import os
 import pathlib
-import stat
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -10,10 +8,15 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from pymax import Client, WebClient
 
+from . import secure
+
 SESSION_DIR = pathlib.Path.home() / ".max-mcp"
 SESSION_FILE = "session.db"
 KIND_FILE = "session.kind"
 PHONE_FILE = "session.phone"
+
+LOGIN_QR = "python -m max_mcp.auth login-qr"
+LOGIN_SMS = "python -m max_mcp.auth login-sms --phone +7..."
 
 
 @dataclass
@@ -21,35 +24,9 @@ class AppCtx:
     client: Any  # WebClient | Client — both share the same public method surface
 
 
-def _check_session_dir() -> None:
-    st = SESSION_DIR.lstat()
-    if stat.S_ISLNK(st.st_mode):
-        raise RuntimeError(f"{SESSION_DIR} is a symlink; refusing to use")
-    if st.st_uid != os.getuid():
-        raise RuntimeError(f"{SESSION_DIR} is not owned by current user")
-    if st.st_mode & 0o077:
-        raise RuntimeError(
-            f"{SESSION_DIR} permissions too open ({oct(st.st_mode & 0o777)}); "
-            "tighten to 0700"
-        )
-
-
-def _read_secret(path: pathlib.Path) -> str | None:
-    if not path.exists():
-        return None
-    if path.is_symlink():
-        raise RuntimeError(f"{path} is a symlink; refusing to read")
-    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
-    try:
-        data = os.read(fd, 4096)
-    finally:
-        os.close(fd)
-    return data.decode("utf-8").strip()
-
-
 def _read_kind() -> tuple[str, str | None]:
-    kind = _read_secret(SESSION_DIR / KIND_FILE) or "web"
-    phone = _read_secret(SESSION_DIR / PHONE_FILE)
+    kind = secure.read_secret(SESSION_DIR / KIND_FILE) or "web"
+    phone = secure.read_secret(SESSION_DIR / PHONE_FILE)
     return kind, phone
 
 
@@ -58,8 +35,7 @@ def _build_client():
     if kind == "sms":
         if not phone:
             raise RuntimeError(
-                f"SMS session marker found but phone is missing. Re-login with: "
-                f"uv run --directory ~/Documents/claude-projects/max-mcp python -m max_mcp.auth login-sms --phone +7..."
+                f"SMS session marker found but phone is missing. Re-login with: {LOGIN_SMS}"
             )
         return Client(
             phone=phone,
@@ -75,10 +51,10 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[AppCtx]:
     if not session_path.exists():
         raise RuntimeError(
             "MAX session missing. Run one of:\n"
-            "  uv run --directory ~/Documents/claude-projects/max-mcp python -m max_mcp.auth login-qr\n"
-            "  uv run --directory ~/Documents/claude-projects/max-mcp python -m max_mcp.auth login-sms --phone +7..."
+            f"  {LOGIN_QR}\n"
+            f"  {LOGIN_SMS}"
         )
-    _check_session_dir()
+    secure.check_dir(SESSION_DIR)
 
     client = _build_client()
     ready = asyncio.Event()

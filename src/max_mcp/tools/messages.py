@@ -5,6 +5,7 @@ from mcp.server.session import ServerSession
 
 from ..client import AppCtx
 from ..normalize import message_to_dict
+from .channels import next_cursor
 
 
 def register(mcp: FastMCP) -> None:
@@ -22,8 +23,7 @@ def register(mcp: FastMCP) -> None:
         )
         page = page or []
         messages = [message_to_dict(m) for m in page]
-        next_before_time = messages[-1]["time"] - 1 if len(messages) >= limit else None
-        return {"messages": messages, "next_before_time": next_before_time}
+        return {"messages": messages, "next_before_time": next_cursor(messages, limit)}
 
     @mcp.tool()
     async def search_messages(

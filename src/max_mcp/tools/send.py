@@ -1,11 +1,13 @@
 import os
 import pathlib
 import stat
+import tempfile
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 
+from .. import secure
 from ..client import AppCtx
 from ..normalize import message_to_dict
 
@@ -15,7 +17,8 @@ VIDEO_EXT = {".mp4", ".mov", ".webm"}
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB hard cap
 
 _HOME = pathlib.Path.home().resolve()
-_DEFAULT_ROOTS = (_HOME / "Downloads", _HOME / "Documents", pathlib.Path("/tmp"))
+_TMP = pathlib.Path(tempfile.gettempdir())
+_DEFAULT_ROOTS = (_HOME / "Downloads", _HOME / "Documents", _TMP)
 _DENY_ROOTS = (
     _HOME / ".max-mcp",
     _HOME / ".ssh",
@@ -25,7 +28,8 @@ _DENY_ROOTS = (
     _HOME / ".kube",
     _HOME / ".docker",
     _HOME / "Library" / "Keychains",
-    pathlib.Path("/etc"),
+    _HOME / "AppData" / "Roaming" / "Microsoft" / "Crypto",
+    pathlib.Path(os.environ.get("SystemRoot", r"C:\Windows")) if secure.IS_WINDOWS else pathlib.Path("/etc"),
     pathlib.Path("/private/etc"),
     pathlib.Path("/var"),
     pathlib.Path("/private/var"),
@@ -33,11 +37,16 @@ _DENY_ROOTS = (
 
 
 def _allowed_roots() -> tuple[pathlib.Path, ...]:
+    """Roots a file may be sent from — ``MAX_MCP_SEND_ROOTS`` overrides the defaults.
+
+    The separator is the platform's own (``:`` on POSIX, ``;`` on Windows,
+    where a bare ``:`` would split every drive letter off its path).
+    """
     env = os.environ.get("MAX_MCP_SEND_ROOTS")
     if not env:
         return tuple(p.resolve() for p in _DEFAULT_ROOTS if p.exists())
     roots: list[pathlib.Path] = []
-    for raw in env.split(":"):
+    for raw in env.split(os.pathsep):
         raw = raw.strip()
         if not raw:
             continue
@@ -46,8 +55,11 @@ def _allowed_roots() -> tuple[pathlib.Path, ...]:
 
 
 def _is_within(child: pathlib.Path, parent: pathlib.Path) -> bool:
+    # normcase so that C:\Users and c:\users are the same root on Windows
+    c = pathlib.PurePath(os.path.normcase(str(child)))
+    p = pathlib.PurePath(os.path.normcase(str(parent)))
     try:
-        child.relative_to(parent)
+        c.relative_to(p)
     except ValueError:
         return False
     return True
@@ -65,9 +77,8 @@ def _validate_path(file_path: str) -> pathlib.Path:
     except (FileNotFoundError, RuntimeError) as e:
         raise ValueError(f"file_path does not resolve: {e}") from e
 
-    # Reject symlinks at the leaf to prevent confused-deputy redirection
-    lst = path.lstat()
-    if stat.S_ISLNK(lst.st_mode):
+    # Reject links at the leaf to prevent confused-deputy redirection
+    if secure.is_link(path):
         raise ValueError("symlinks are not allowed as file_path")
 
     st = resolved.lstat()
@@ -133,9 +144,10 @@ def register(mcp: FastMCP) -> None:
         """Send a file/photo/video to a MAX chat. Attachment type picked by extension.
 
         file_path must be a real file inside one of the allowed roots
-        (default: ~/Downloads, ~/Documents, /tmp; override via
-        MAX_MCP_SEND_ROOTS env var, colon-separated). Symlinks are rejected;
-        paths under ~/.ssh, ~/.aws, ~/.max-mcp, /etc, /var are denied.
+        (default: ~/Downloads, ~/Documents, the system temp dir; override via
+        MAX_MCP_SEND_ROOTS env var, separated by os.pathsep — ':' on POSIX,
+        ';' on Windows). Symlinks are rejected; paths under ~/.ssh, ~/.aws,
+        ~/.max-mcp, /etc, /var (C:\\Windows on Windows) are denied.
         """
         path = _validate_path(file_path)
         client = ctx.request_context.lifespan_context.client

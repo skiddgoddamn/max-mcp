@@ -1,8 +1,6 @@
 import argparse
 import asyncio
-import os
 import pathlib
-import stat
 import sys
 
 from pymax import (
@@ -13,49 +11,18 @@ from pymax import (
     WebClient,
 )
 
+from . import secure
+
 SESSION_DIR = pathlib.Path.home() / ".max-mcp"
 SESSION_FILE = "session.db"
 KIND_FILE = "session.kind"
 PHONE_FILE = "session.phone"
 
 
-def _ensure_session_dir() -> None:
-    SESSION_DIR.mkdir(mode=0o700, exist_ok=True)
-    st = SESSION_DIR.lstat()
-    if stat.S_ISLNK(st.st_mode):
-        raise RuntimeError(f"{SESSION_DIR} is a symlink; refusing to use")
-    if st.st_uid != os.getuid():
-        raise RuntimeError(f"{SESSION_DIR} is not owned by current user")
-    if st.st_mode & 0o077:
-        SESSION_DIR.chmod(0o700)
-
-
-def _write_secret(path: pathlib.Path, data: str) -> None:
-    if path.is_symlink():
-        path.unlink()
-    fd = os.open(
-        str(path),
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-        0o600,
-    )
-    try:
-        os.write(fd, data.encode("utf-8"))
-    finally:
-        os.close(fd)
-    os.chmod(path, 0o600)
-
-
-def _harden_session_file() -> None:
-    path = SESSION_DIR / SESSION_FILE
-    if path.is_symlink():
-        raise RuntimeError(f"{path} is a symlink; refusing to chmod target")
-    path.chmod(0o600)
-
-
 def _mark_session(kind: str, phone: str | None = None) -> None:
-    _write_secret(SESSION_DIR / KIND_FILE, kind)
+    secure.write_secret(SESSION_DIR / KIND_FILE, kind)
     if phone:
-        _write_secret(SESSION_DIR / PHONE_FILE, phone)
+        secure.write_secret(SESSION_DIR / PHONE_FILE, phone)
 
 
 def _print_me(c) -> None:
@@ -66,26 +33,47 @@ def _print_me(c) -> None:
     )
 
 
+async def _start_until_logged_in(client, logged_in: asyncio.Event) -> None:
+    """Run the login flow, tolerating the cancellation that shutdown leaks.
+
+    ``on_start`` calls ``client.stop()`` the moment the login succeeds, which
+    cancels the WebSocket reader that ``client.start()`` is still awaiting; the
+    cancellation then surfaces here even though the session is already on disk
+    (upstream issue #1), leaving ``session.kind`` unwritten. It is swallowed
+    only once the login has been confirmed and only when this task was not
+    cancelled from the outside.
+    """
+    try:
+        await client.start()
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        cancelled_externally = task is not None and task.cancelling() > 0
+        if cancelled_externally or not logged_in.is_set():
+            raise
+
+
 async def _login_qr() -> None:
-    _ensure_session_dir()
+    secure.ensure_dir(SESSION_DIR)
     client = WebClient(
         work_dir=str(SESSION_DIR),
         session_name=SESSION_FILE,
         qr_provider=ConsoleQrHandler(),
     )
+    logged_in = asyncio.Event()
 
     @client.on_start()
     async def _ready(c: WebClient) -> None:
         _print_me(c)
+        logged_in.set()
         await c.stop()
 
-    await client.start()
-    _harden_session_file()
+    await _start_until_logged_in(client, logged_in)
+    secure.harden_file(SESSION_DIR / SESSION_FILE)
     _mark_session("web")
 
 
 async def _login_sms(phone: str) -> None:
-    _ensure_session_dir()
+    secure.ensure_dir(SESSION_DIR)
     client = Client(
         phone=phone,
         work_dir=str(SESSION_DIR),
@@ -93,14 +81,16 @@ async def _login_sms(phone: str) -> None:
         sms_code_provider=ConsoleSmsCodeProvider(),
         password_provider=ConsolePasswordProvider(),
     )
+    logged_in = asyncio.Event()
 
     @client.on_start()
     async def _ready(c: Client) -> None:
         _print_me(c)
+        logged_in.set()
         await c.stop()
 
-    await client.start()
-    _harden_session_file()
+    await _start_until_logged_in(client, logged_in)
+    secure.harden_file(SESSION_DIR / SESSION_FILE)
     _mark_session("sms", phone=phone)
 
 
