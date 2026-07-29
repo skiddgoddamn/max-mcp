@@ -1,7 +1,7 @@
 from mcp.server.fastmcp import FastMCP
 
 from .client import lifespan
-from .tools import channels, chats, contacts, messages, send
+from .tools import channels, chats, contacts, links, messages, send
 
 INSTRUCTIONS = (
     "MAX messenger user-session tools. Use list_chats/get_chat to discover chats. "
@@ -10,7 +10,9 @@ INSTRUCTIONS = (
     "call). send_message/send_file for writes. Contacts: find_user_by_phone / "
     "get_user resolve people; add_contact/remove_contact/list_contacts/"
     "import_contacts manage the phone book; send_message_by_phone DMs someone by "
-    "number in one call (get_dialog_chat_id gives the 1:1 chat_id from a user id)."
+    "number in one call (get_dialog_chat_id gives the 1:1 chat_id from a user id). "
+    "Public links: resolve_link turns a max.ru/u/<token> or max.ru/id..._biz link "
+    "into a chat_id/user_id; send_message_by_link resolves and DMs in one call."
 )
 
 mcp = FastMCP("max-mcp", instructions=INSTRUCTIONS, lifespan=lifespan)
@@ -19,6 +21,7 @@ messages.register(mcp)
 channels.register(mcp)
 send.register(mcp)
 contacts.register(mcp)
+links.register(mcp)
 
 
 def main() -> None:

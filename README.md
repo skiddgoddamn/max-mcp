@@ -355,6 +355,50 @@ $env:MAX_MCP_SEND_ROOTS = "$HOME\Desktop;D:\exports"
 
 ---
 
+### Links
+
+#### `resolve_link(link)`
+
+Turn a public MAX link into an id you can message. `send_message` only takes a
+numeric `chat_id`, so opaque profile links (`max.ru/u/<token>`) and business /
+username links (`max.ru/id123_biz`, `max.ru/<name>`) need resolving first.
+
+Accepts a full URL, a scheme-less `max.ru/...`, or a bare slug — all are reduced
+to the bare slug the server's `LINK_INFO` lookup expects (the host prefix must be
+stripped, `max.ru/id123_biz` verbatim returns *not found*).
+
+```json
+{
+  "input": "https://max.ru/id2465215235_biz",
+  "slug": "id2465215235_biz",
+  "kind": "chat",
+  "chat_id": -70622366624393,
+  "chat_type": "CHANNEL",
+  "title": "TERVE группа медицинских компаний",
+  "access": "PUBLIC",
+  "participants_count": 108,
+  "canonical_link": "https://max.ru/id2465215235_biz"
+}
+```
+
+Personal `u/` links resolve to a user — the result then carries `kind: "user"`,
+`user_id`, `name` and the derived 1:1 dialog `chat_id` (feed it straight to
+`send_message`). Raises if MAX can't resolve the link (expired / private / not a
+MAX link).
+
+> Business `id..._biz` links are usually **public CHANNELs** you can't DM unless
+> you're an admin — check `chat_type` / `access` before trying to write.
+
+---
+
+#### `send_message_by_link(link, text)`
+
+Resolve a link and send `text` in one call. Best for personal share links
+(`max.ru/u/<token>`): resolves the contact, derives the 1:1 dialog and sends.
+Returns the sent message plus the `resolved` block from `resolve_link`.
+
+---
+
 ## Output field reference
 
 | Field | Type | Notes |
@@ -468,8 +512,9 @@ Everything below is fixed relative to [renosaza/max-mcp](https://github.com/reno
 | 5 | `MAX_MCP_SEND_ROOTS` was split on `":"`, which tears `C:\Users\me` into `C` and `\Users\me` — every Windows allowlist silently became empty, so `send_file` refused everything. | Split on `os.pathsep`; root matching is `normcase`d so drive-letter case does not matter; `/tmp` default replaced by `tempfile.gettempdir()`. |
 | 6 | Error messages hardcoded the author's own path (`~/Documents/claude-projects/max-mcp`). | Replaced with the module-invocation commands that work from any checkout. |
 | 7 | No tests at all. | 18 tests covering pagination, cursors, the secure-storage round-trip, ACL narrowing on Windows and `send_file` path validation. |
+| 8 | **No way to message someone from a public link.** `send_message` needs a numeric `chat_id`; there was no tool to turn a `max.ru/u/<token>` or `max.ru/id..._biz` link into one. Treating the digits in `id2465235_biz` as a user id fails (`User not found`) — they're a link slug, not an id. | New `resolve_link` / `send_message_by_link` tools call MAX's `LINK_INFO` opcode with the bare slug (host prefix stripped — the server rejects `max.ru/…` verbatim) and return the `chat_id` (or `user_id` + derived 1:1 dialog id for personal links). Verified live against a business link. |
 
-Not changed: the tool surface (still the same 8 tools), the protocol layer, or the security model's intent.
+Not changed: the protocol layer or the security model's intent.
 
 ---
 
